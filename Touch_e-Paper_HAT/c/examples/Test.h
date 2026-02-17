@@ -12,5 +12,6 @@ int TestCode_2in13_V3(void);
 int TestCode_2in9(void);
 int Flight(void);
 int TestCode_SysStats(void);
+int TestCode_SysStats_2in9(void);
 
 #endif

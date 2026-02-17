@@ -6,62 +6,86 @@
 #include <string.h>
 #include <unistd.h>
 
+#define SYSSTATS_FORCE_FULL_REFRESH 1
+
 extern GT1151_Dev Dev_Now, Dev_Old;
 extern int IIC_Address;
-static pthread_t t1;
-UBYTE flag_t = 1;
+static pthread_t sysstat_t;
+UBYTE sysstat_flag = 1;
 
-UBYTE *BlackImage;
+UBYTE *SysStatImage;
 
-void Handler(int signo)
+void SysStats_Handler(int signo)
 {
     printf("\r\nHandler:exit\r\n");
     EPD_2IN13_V2_Sleep();
     DEV_Delay_ms(2000);
-    flag_t = 0;
-    pthread_join(t1, NULL);
+    sysstat_flag = 0;
+    pthread_join(sysstat_t, NULL);
     DEV_ModuleExit();
     exit(0);
 }
 
-void *pthread_irq(void *arg)
+void *sysstat_pthread_irq(void *arg)
 {
-    while(flag_t) {
+    while(sysstat_flag) {
         if(DEV_Digital_Read(INT) == 0) {
             Dev_Now.Touch = 1;
         } else {
             Dev_Now.Touch = 0;
         }
-        DEV_Delay_ms(10);
+        usleep(200000);
     }
     printf("thread:exit\r\n");
     pthread_exit(NULL);
 }
 
 // Get CPU usage from /proc/stat
-double get_cpu_usage() {
-    static unsigned long prev_idle = 0, prev_total = 0;
-    unsigned long user, nice, system, idle, total;
-    double cpu_percent = 0.0;
-    
+double get_cpu_usage(void) {
+    static unsigned long long prev_idle = 0;
+    static unsigned long long prev_total = 0;
+
+    unsigned long long user = 0, nice = 0, system = 0, idle = 0;
+    unsigned long long iowait = 0, irq = 0, softirq = 0, steal = 0;
+    unsigned long long guest = 0, guest_nice = 0;
+
     FILE *fp = fopen("/proc/stat", "r");
-    if (fp) {
-        fscanf(fp, "cpu %lu %lu %lu %lu", &user, &nice, &system, &idle);
-        fclose(fp);
-        
-        unsigned long curr_total = user + nice + system + idle;
-        unsigned long curr_idle = idle;
-        
-        if (prev_total > 0) {
-            unsigned long total_diff = curr_total - prev_total;
-            unsigned long idle_diff = curr_idle - prev_idle;
-            cpu_percent = (total_diff - idle_diff) * 100.0 / total_diff;
-        }
-        
-        prev_idle = curr_idle;
-        prev_total = curr_total;
+    if (fp == NULL) {
+        return 0.0;
     }
-    return cpu_percent;
+
+    int read = fscanf(
+        fp,
+        "cpu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+        &user, &nice, &system, &idle, &iowait,
+        &irq, &softirq, &steal, &guest, &guest_nice
+    );
+    fclose(fp);
+    if (read < 4) {
+        return 0.0;
+    }
+
+    unsigned long long idle_all = idle + iowait;
+    unsigned long long non_idle = user + nice + system + irq + softirq + steal;
+    unsigned long long total = idle_all + non_idle;
+
+    if (prev_total == 0) {
+        prev_total = total;
+        prev_idle = idle_all;
+        return 0.0;
+    }
+
+    unsigned long long total_diff = total - prev_total;
+    unsigned long long idle_diff = idle_all - prev_idle;
+
+    prev_total = total;
+    prev_idle = idle_all;
+
+    if (total_diff == 0) {
+        return 0.0;
+    }
+
+    return (double)(total_diff - idle_diff) * 100.0 / (double)total_diff;
 }
 
 // Get memory usage from /proc/meminfo
@@ -136,36 +160,36 @@ void update_stats_display() {
     // Clear image (white)
     UWORD Imagesize = ((EPD_2IN13_V2_WIDTH % 8 == 0) ? (EPD_2IN13_V2_WIDTH / 8) : (EPD_2IN13_V2_WIDTH / 8 + 1)) * EPD_2IN13_V2_HEIGHT;
     for (UWORD i = 0; i < Imagesize; i++) {
-        BlackImage[i] = 0xFF;
+        SysStatImage[i] = 0xFF;
     }
     
     // Draw text and bars
-    Paint_SelectImage(BlackImage);
+    Paint_SelectImage(SysStatImage);
     Paint_SetMirroring(MIRROR_HORIZONTAL);
     Paint_DrawString_EN(2, 2, "System Stats", &Font20, BLACK, WHITE);
     
     char buf[64];
     snprintf(buf, sizeof(buf), "CPU: %.1f%%", cpu);
     Paint_DrawString_EN(2, 30, buf, &Font16, BLACK, WHITE);
-    draw_bar(BlackImage, 2, 50, 100, 8, cpu);
+    draw_bar(SysStatImage, 2, 50, 100, 8, cpu);
     
     snprintf(buf, sizeof(buf), "Memory: %.1f%%", mem_percent);
     Paint_DrawString_EN(2, 70, buf, &Font16, BLACK, WHITE);
     snprintf(buf, sizeof(buf), "%dMB / %dMB", mem_used, mem_total);
     Paint_DrawString_EN(2, 85, buf, &Font12, BLACK, WHITE);
-    draw_bar(BlackImage, 2, 95, 100, 8, mem_percent);
+    draw_bar(SysStatImage, 2, 95, 100, 8, mem_percent);
     
     snprintf(buf, sizeof(buf), "Update: %d", update_count++);
     Paint_DrawString_EN(2, 230, buf, &Font12, BLACK, WHITE);
     
-    // Send to display
-    if (update_count == 1) {
-        EPD_2IN13_V2_DisplayPartBaseImage(BlackImage);
+    if (SYSSTATS_FORCE_FULL_REFRESH || update_count == 1 || (update_count % 30) == 0) {
+        EPD_2IN13_V2_Init(EPD_2IN13_V2_FULL);
+        EPD_2IN13_V2_DisplayPartBaseImage(SysStatImage);
         EPD_2IN13_V2_Init(EPD_2IN13_V2_PART);
-        printf("*** First display update (base image) ***\r\n");
+        printf("*** FULL update %d (cpu=%.1f%%, mem=%.1f%%) ***\r\n", update_count, cpu, mem_percent);
     } else {
-        EPD_2IN13_V2_DisplayPart_Wait(BlackImage);
-        printf("*** Display update %d (cpu=%.1f%%, mem=%.1f%%) ***\r\n", update_count, cpu, mem_percent);
+        EPD_2IN13_V2_DisplayPart_Wait(SysStatImage);
+        printf("*** PART update %d (cpu=%.1f%%, mem=%.1f%%) ***\r\n", update_count, cpu, mem_percent);
     }
 }
 
@@ -173,11 +197,10 @@ int TestCode_SysStats(void)
 {
     IIC_Address = 0x14;
     
-    UBYTE SelfFlag = 0;
-    signal(SIGINT, Handler);
+    signal(SIGINT, SysStats_Handler);
     DEV_ModuleInit();
     
-    pthread_create(&t1, NULL, pthread_irq, NULL);
+    pthread_create(&sysstat_t, NULL, sysstat_pthread_irq, NULL);
     
     EPD_2IN13_V2_Init(EPD_2IN13_V2_FULL);
     EPD_2IN13_V2_Clear();
@@ -187,21 +210,21 @@ int TestCode_SysStats(void)
     
     // Create image buffer
     UWORD Imagesize = ((EPD_2IN13_V2_WIDTH % 8 == 0) ? (EPD_2IN13_V2_WIDTH / 8) : (EPD_2IN13_V2_WIDTH / 8 + 1)) * EPD_2IN13_V2_HEIGHT;
-    if ((BlackImage = (UBYTE *)malloc(Imagesize)) == NULL) {
+    if ((SysStatImage = (UBYTE *)malloc(Imagesize)) == NULL) {
         printf("Failed to allocate memory\r\n");
         return -1;
     }
     printf("Image buffer allocated: %d bytes\r\n", Imagesize);
     
-    Paint_NewImage(BlackImage, EPD_2IN13_V2_WIDTH, EPD_2IN13_V2_HEIGHT, 0, WHITE);
-    Paint_SelectImage(BlackImage);
+    Paint_NewImage(SysStatImage, EPD_2IN13_V2_WIDTH, EPD_2IN13_V2_HEIGHT, 0, WHITE);
+    Paint_SelectImage(SysStatImage);
     Paint_SetMirroring(MIRROR_HORIZONTAL);
     Paint_Clear(WHITE);
     
     Paint_DrawString_EN(5, 50, "System Stats Monitor", &Font24, BLACK, WHITE);
     Paint_DrawString_EN(5, 100, "Starting display...", &Font16, BLACK, WHITE);
     
-    EPD_2IN13_V2_DisplayPartBaseImage(BlackImage);
+    EPD_2IN13_V2_DisplayPartBaseImage(SysStatImage);
     EPD_2IN13_V2_Init(EPD_2IN13_V2_PART);
     
     printf("Starting main update loop...\r\n");
@@ -217,7 +240,7 @@ int TestCode_SysStats(void)
             Dev_Now.Touch = 0;
         }
         
-        sleep(2);  // Update every 2 seconds
+        sleep(5);  // Update every 5 seconds to reduce self-load
     }
     
     return 0;
