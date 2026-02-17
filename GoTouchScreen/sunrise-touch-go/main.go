@@ -31,9 +31,8 @@ type rect struct {
 
 type appState struct {
 	invert       bool
-	paused       bool
-	funMode      bool
 	manualRedraw bool
+	exitRequested bool
 }
 
 type gt1151 struct {
@@ -107,7 +106,7 @@ func (g *gt1151) poll() (*touchPoint, error) {
 func main() {
 	lat := flag.Float64("lat", 37.7749, "latitude")
 	lon := flag.Float64("lon", -122.4194, "longitude")
-	interval := flag.Duration("interval", 20*time.Second, "stats refresh interval")
+	interval := flag.Duration("interval", 15*time.Minute, "stats refresh interval")
 	poll := flag.Duration("poll", 250*time.Millisecond, "touch poll interval")
 	flag.Parse()
 
@@ -141,11 +140,12 @@ func main() {
 	if err := display.Clear(color.White); err != nil {
 		log.Fatal(err)
 	}
+	displaySleeping := false
 
-	state := appState{funMode: true}
+	state := appState{}
 	lastTouch := touchPoint{-1, -1}
 	lastTouchAt := time.Now().Add(-time.Hour)
-	lastMinute := ""
+	lastTouchErrAt := time.Now().Add(-time.Hour)
 	lastDrawAt := time.Time{}
 	drawCount := 0
 
@@ -157,18 +157,18 @@ func main() {
 			sunrise = now.Add(6 * time.Hour)
 		}
 		until := sunrise.Sub(now)
-		minuteKey := now.Format("2006-01-02 15:04")
-
-		shouldDraw := state.manualRedraw || lastDrawAt.IsZero() || minuteKey != lastMinute
-		if !state.paused && now.Sub(lastDrawAt) >= *interval {
-			shouldDraw = true
-		}
-		if state.funMode && !state.paused && now.Sub(lastDrawAt) >= 2*time.Second {
+		shouldDraw := state.manualRedraw || lastDrawAt.IsZero()
+		if now.Sub(lastDrawAt) >= *interval {
 			shouldDraw = true
 		}
 
 		if touch != nil {
-			if tp, err := touch.poll(); err == nil && tp != nil {
+			if tp, err := touch.poll(); err != nil {
+				if time.Since(lastTouchErrAt) > 3*time.Second {
+					log.Printf("touch poll error: %v", err)
+					lastTouchErrAt = time.Now()
+				}
+			} else if tp != nil {
 				if tp.x == lastTouch.x && tp.y == lastTouch.y && time.Since(lastTouchAt) < 700*time.Millisecond {
 					// Debounce.
 				} else {
@@ -182,7 +182,33 @@ func main() {
 			}
 		}
 
+		if state.exitRequested {
+			if displaySleeping {
+				if err := display.Init(); err != nil {
+					log.Printf("display wake/init for exit failed: %v", err)
+				}
+				displaySleeping = false
+			}
+			if err := display.Clear(color.White); err != nil {
+				log.Printf("exit clear failed: %v", err)
+			}
+			if err := display.Sleep(); err != nil {
+				log.Printf("exit sleep failed: %v", err)
+			}
+			log.Printf("exit requested, shutting down app")
+			return
+		}
+
 		if shouldDraw {
+			if displaySleeping {
+				if err := display.Init(); err != nil {
+					log.Printf("display wake/init failed: %v", err)
+					time.Sleep(*poll)
+					continue
+				}
+				displaySleeping = false
+			}
+
 			drawCount++
 			frame := renderLandscape(now, sunrise, until, *lat, *lon, drawCount, state)
 			portrait := landscapeToPortrait(frame)
@@ -190,8 +216,11 @@ func main() {
 			draw.Draw(img, img.Bounds(), portrait, image.Point{}, draw.Src)
 			if err := display.Draw(display.Bounds(), img, image.Point{}); err != nil {
 				log.Printf("draw failed: %v", err)
+			} else if err := display.Sleep(); err != nil {
+				log.Printf("display sleep failed: %v", err)
+			} else {
+				displaySleeping = true
 			}
-			lastMinute = minuteKey
 			lastDrawAt = now
 			state.manualRedraw = false
 		}
@@ -201,26 +230,29 @@ func main() {
 
 func mapTouchToLandscape(px, py int) (int, int) {
 	// Touch is reported in portrait (122x250). Dashboard is landscape (250x122).
-	return py, 121 - px
+	// This mapping matches a 90-degree clockwise rotation.
+	return 249 - py, px
 }
 
 func handleTouch(st *appState, x, y int) {
-	buttonTheme := rect{4, 2, 52, 20}
-	buttonPause := rect{56, 2, 104, 20}
-	buttonRefresh := rect{108, 2, 166, 20}
-	buttonFun := rect{170, 2, 246, 20}
+	// Use broad top-row zones so touches remain reliable despite panel variance.
+	buttonLight := rect{0, 0, 82, 44}
+	buttonDark := rect{83, 0, 165, 44}
+	buttonExit := rect{166, 0, 249, 44}
 	switch {
-	case inside(buttonTheme, x, y):
-		st.invert = !st.invert
+	case inside(buttonLight, x, y):
+		st.invert = false
 		st.manualRedraw = true
-	case inside(buttonPause, x, y):
-		st.paused = !st.paused
+		log.Printf("button: LIGHT")
+	case inside(buttonDark, x, y):
+		st.invert = true
 		st.manualRedraw = true
-	case inside(buttonRefresh, x, y):
-		st.manualRedraw = true
-	case inside(buttonFun, x, y):
-		st.funMode = !st.funMode
-		st.manualRedraw = true
+		log.Printf("button: DARK")
+	case inside(buttonExit, x, y):
+		st.exitRequested = true
+		log.Printf("button: EXIT")
+	default:
+		log.Printf("button: none")
 	}
 }
 
@@ -242,14 +274,13 @@ func renderLandscape(now, sunrise time.Time, until time.Duration, lat, lon float
 
 	// Header + controls
 	line(img, 0, 22, w-1, 22, fg)
-	drawButton(img, rect{4, 2, 52, 20}, "THEME", st.invert, fg, bg)
-	drawButton(img, rect{56, 2, 104, 20}, "PAUSE", st.paused, fg, bg)
-	drawButton(img, rect{108, 2, 166, 20}, "REFRESH", false, fg, bg)
-	drawButton(img, rect{170, 2, 246, 20}, "FUN", st.funMode, fg, bg)
-	text(img, 8, 16, "Sunrise Touch", fg)
+	drawButton(img, rect{4, 2, 80, 20}, "LIGHT", !st.invert, fg, bg)
+	drawButton(img, rect{84, 2, 160, 20}, "DARK", st.invert, fg, bg)
+	drawButton(img, rect{164, 2, 246, 20}, "EXIT", false, fg, bg)
 
 	// Main split
 	line(img, 125, 23, 125, h-1, fg)
+	text(img, 132, 36, "Sunrise Touch", fg)
 
 	// Left panel: countdown
 	untilStr := formatDur(until)
@@ -268,11 +299,9 @@ func renderLandscape(now, sunrise time.Time, until time.Duration, lat, lon float
 	sunX := 132 + int(110*p)
 	sunY := 90 - int(26*math.Sin((p-0.25)*2*math.Pi))
 	circle(img, sunX, sunY, 8, fg, false)
-	if st.funMode && !st.paused {
-		cloudX := 132 + (tick*7)%108
-		line(img, cloudX, 42, cloudX+16, 42, fg)
-		line(img, cloudX+2, 39, cloudX+14, 39, fg)
-	}
+	cloudX := 132 + (tick*7)%108
+	line(img, cloudX, 42, cloudX+16, 42, fg)
+	line(img, cloudX+2, 39, cloudX+14, 39, fg)
 	text(img, 132, 108, now.Format("Mon 03:04 PM"), fg)
 
 	return img
