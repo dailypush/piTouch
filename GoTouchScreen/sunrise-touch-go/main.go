@@ -12,7 +12,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"time"
+	"unsafe"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
@@ -139,6 +141,7 @@ func main() {
 	lonFlag := flag.Float64("lon", -122.4194, "longitude")
 	intervalFlag := flag.Duration("interval", 15*time.Minute, "stats refresh interval")
 	pollFlag := flag.Duration("poll", 250*time.Millisecond, "touch poll interval")
+	partialFlag := flag.Bool("partial", false, "enable partial refresh policy")
 	configPath := flag.String("config", "/home/chad/.config/sunrise-touch-go/config.json", "settings file path")
 	flag.Parse()
 
@@ -159,8 +162,8 @@ func main() {
 	} else {
 		log.Printf("config load skipped: %v", err)
 	}
-	if cfg.IntervalSeconds < 60 {
-		cfg.IntervalSeconds = int64((15 * time.Minute) / time.Second)
+	if cfg.IntervalSeconds < 180 {
+		cfg.IntervalSeconds = 180
 	}
 	if cfg.Theme < 0 || cfg.Theme > 2 {
 		if cfg.DarkMode {
@@ -172,6 +175,9 @@ func main() {
 	lat := cfg.Lat
 	lon := cfg.Lon
 	refreshEvery := time.Duration(cfg.IntervalSeconds) * time.Second
+	if refreshEvery < 180*time.Second {
+		refreshEvery = 180 * time.Second
+	}
 	cal := touchCalibration{
 		xScale:  cfg.CalXScale,
 		yScale:  cfg.CalYScale,
@@ -212,7 +218,9 @@ func main() {
 	if err := display.Init(); err != nil {
 		log.Fatal(err)
 	}
-	partialEnabled := trySetPartialMode(display)
+	partialEnabled := *partialFlag
+	log.Printf("partial policy enabled=%v", partialEnabled)
+	_ = setDisplayMode(display, false)
 	if err := display.Clear(color.White); err != nil {
 		log.Fatal(err)
 	}
@@ -228,6 +236,8 @@ func main() {
 	drawCount := 0
 	touchCount := 0
 	startedAt := time.Now()
+	partialSinceFull := 0
+	lastFullRefresh := time.Now()
 
 	for {
 		now := time.Now()
@@ -297,7 +307,7 @@ func main() {
 					time.Sleep(*pollFlag)
 					continue
 				}
-				partialEnabled = trySetPartialMode(display)
+				_ = setDisplayMode(display, false)
 				displaySleeping = false
 			}
 
@@ -308,17 +318,37 @@ func main() {
 			draw.Draw(img, img.Bounds(), portrait, image.Point{}, draw.Src)
 			drawRect := display.Bounds()
 			shouldSend := true
-			if partialEnabled {
+			usePartial := partialEnabled && lastPortrait != nil
+			forceFull := !usePartial || partialSinceFull >= 6 || now.Sub(lastFullRefresh) >= 24*time.Hour
+			if usePartial {
 				if diff, ok := diffRectGray(lastPortrait, portrait); ok {
-					drawRect = diff
+					drawRect = alignRectForEPD(diff, display.Bounds())
 				} else {
 					shouldSend = false
 				}
 			}
 			if shouldSend {
+				if forceFull {
+					drawRect = display.Bounds()
+					_ = setDisplayMode(display, false)
+				} else {
+					_ = setDisplayMode(display, true)
+				}
 				if err := display.Draw(drawRect, img, image.Point{}); err != nil {
 					log.Printf("draw failed: %v", err)
 				} else if err := display.Sleep(); err != nil {
+					log.Printf("display sleep failed: %v", err)
+				} else {
+					displaySleeping = true
+					if forceFull {
+						partialSinceFull = 0
+						lastFullRefresh = now
+					} else {
+						partialSinceFull++
+					}
+				}
+			} else if !displaySleeping {
+				if err := display.Sleep(); err != nil {
 					log.Printf("display sleep failed: %v", err)
 				} else {
 					displaySleeping = true
@@ -479,13 +509,7 @@ func handleCalibrationTouch(st *appState, rawX, rawY int, lat, lon *float64, ref
 }
 
 func handleExitTap(st *appState) {
-	now := time.Now()
-	if !st.exitArmedUntil.IsZero() && now.Before(st.exitArmedUntil) {
-		st.exitRequested = true
-		return
-	}
-	st.exitArmedUntil = now.Add(8 * time.Second)
-	st.manualRedraw = true
+	st.exitRequested = true
 }
 
 func inside(r rect, x, y int) bool {
@@ -499,6 +523,11 @@ func renderLandscape(now, sunrise time.Time, until time.Duration, lat, lon float
 
 	img := image.NewGray(image.Rect(0, 0, w, h))
 	draw.Draw(img, img.Bounds(), &image.Uniform{color.Gray{Y: bg}}, image.Point{}, draw.Src)
+
+	if st.showCalibration {
+		renderCalibrationView(img, st, fg, bg)
+		return img
+	}
 
 	if st.showSettings {
 		renderSettingsView(img, st, fg, bg)
@@ -562,8 +591,43 @@ func renderSettingsView(img *image.Gray, st appState, fg, bg uint8) {
 	drawButton(img, rect{88, 90, 118, 110}, "+", false, fg, bg)
 
 	drawButton(img, rect{132, 62, 246, 82}, "THEME CYCLE", false, fg, bg)
+	drawButton(img, rect{132, 34, 246, 54}, "CALIBRATE", false, fg, bg)
 	text(img, 132, 98, fmt.Sprintf("theme:%d", st.theme), fg)
 	text(img, 132, 112, "persist on SAVE", fg)
+}
+
+func renderCalibrationView(img *image.Gray, st appState, fg, bg uint8) {
+	line(img, 0, 22, 249, 22, fg)
+	drawButton(img, rect{4, 2, 116, 20}, "BACK", false, fg, bg)
+	applyActive := st.calibStep >= 3
+	drawButton(img, rect{120, 2, 246, 20}, "APPLY", applyActive, fg, bg)
+	text(img, 8, 36, "Touch 3 targets", fg)
+
+	targets := [3]touchPoint{
+		{x: 20, y: 38},
+		{x: 230, y: 38},
+		{x: 125, y: 106},
+	}
+	for i := 0; i < 3; i++ {
+		cx, cy := targets[i].x, targets[i].y
+		done := i < st.calibStep
+		if done {
+			circle(img, cx, cy, 8, fg, true)
+		} else {
+			circle(img, cx, cy, 8, fg, false)
+		}
+		line(img, cx-10, cy, cx+10, cy, fg)
+		line(img, cx, cy-10, cx, cy+10, fg)
+	}
+	stepText := "step 1/3"
+	if st.calibStep == 1 {
+		stepText = "step 2/3"
+	} else if st.calibStep == 2 {
+		stepText = "step 3/3"
+	} else if st.calibStep >= 3 {
+		stepText = "ready: tap APPLY"
+	}
+	text(img, 8, 118, stepText, fg)
 }
 
 func themeColors(theme int) (uint8, uint8) {
@@ -654,10 +718,90 @@ func saveConfig(path string, cfg persistedConfig) error {
 	return os.WriteFile(path, b, 0o644)
 }
 
-func trySetPartialMode(display *waveshare2in13v4.Dev) bool {
-	_ = display
-	log.Printf("partial mode disabled (driver compatibility)")
-	return false
+func persistRuntimeConfig(path string, lat, lon float64, refreshEvery time.Duration, theme int, cal touchCalibration) error {
+	cfg := persistedConfig{
+		Lat:             lat,
+		Lon:             lon,
+		IntervalSeconds: int64(refreshEvery / time.Second),
+		DarkMode:        theme == 1,
+		Theme:           theme,
+		CalXScale:       cal.xScale,
+		CalYScale:       cal.yScale,
+		CalXOffset:      cal.xOffset,
+		CalYOffset:      cal.yOffset,
+	}
+	return saveConfig(path, cfg)
+}
+
+func applyCalibration(x, y int, cal touchCalibration) (int, int) {
+	cx := int(math.Round(float64(x)*cal.xScale + cal.xOffset))
+	cy := int(math.Round(float64(y)*cal.yScale + cal.yOffset))
+	if cx < 0 {
+		cx = 0
+	}
+	if cx > 249 {
+		cx = 249
+	}
+	if cy < 0 {
+		cy = 0
+	}
+	if cy > 121 {
+		cy = 121
+	}
+	return cx, cy
+}
+
+func computeCalibration(raw [3]touchPoint) (touchCalibration, error) {
+	targets := [3]touchPoint{
+		{x: 20, y: 38},
+		{x: 230, y: 38},
+		{x: 125, y: 106},
+	}
+	dx := float64(raw[1].x - raw[0].x)
+	dy := float64(raw[2].y - raw[0].y)
+	if math.Abs(dx) < 2 || math.Abs(dy) < 2 {
+		return touchCalibration{}, errors.New("touch points too close, retry calibration")
+	}
+	xScale := float64(targets[1].x-targets[0].x) / dx
+	yScale := float64(targets[2].y-targets[0].y) / dy
+	xOffset := float64(targets[0].x) - float64(raw[0].x)*xScale
+	yOffset := float64(targets[0].y) - float64(raw[0].y)*yScale
+	if math.Abs(xScale) > 3 || math.Abs(yScale) > 3 {
+		return touchCalibration{}, errors.New("invalid scale computed, retry calibration")
+	}
+	return touchCalibration{xScale: xScale, yScale: yScale, xOffset: xOffset, yOffset: yOffset}, nil
+}
+
+func setDisplayMode(display *waveshare2in13v4.Dev, partial bool) error {
+	v := reflect.ValueOf(display).Elem().FieldByName("mode")
+	if !v.IsValid() || !v.CanAddr() {
+		return errors.New("display mode field unavailable")
+	}
+	ptr := reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem()
+	if partial {
+		ptr.Set(reflect.ValueOf(waveshare2in13v4.Partial))
+	} else {
+		ptr.Set(reflect.ValueOf(waveshare2in13v4.Full))
+	}
+	return nil
+}
+
+func alignRectForEPD(r, bounds image.Rectangle) image.Rectangle {
+	if r.Empty() {
+		return r
+	}
+	x0 := r.Min.X &^ 7
+	x1 := (r.Max.X + 7) &^ 7
+	if x0 < bounds.Min.X {
+		x0 = bounds.Min.X
+	}
+	if x1 > bounds.Max.X {
+		x1 = bounds.Max.X
+	}
+	if x1 <= x0 {
+		return bounds
+	}
+	return image.Rect(x0, r.Min.Y, x1, r.Max.Y).Intersect(bounds)
 }
 
 func diffRectGray(prev, curr *image.Gray) (image.Rectangle, bool) {
